@@ -1,0 +1,2 @@
+Use conda env : conda activate eldenring_sync DOT NOT USE .venv
+game folder in this merchine : E:\Program\Steam\steamapps\common\ELDEN RING
