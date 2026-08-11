@@ -24,17 +24,47 @@ REPOSITORY_URL = "https://github.com/97AlexNguyen/elden_ring_mod_sync.git"
 BRANCH = "main"
 SOURCE_DIRECTORY = "_mod_data"
 STATE_FILE_NAME = ".elden_ring_mod_sync.json"
+LAUNCH_BAT_NAME = "launchmod_eldenring.bat"
+SETTINGS_FILE_NAME = "settings.json"
 
 
 class SyncError(RuntimeError):
     pass
 
 
-def cache_directory() -> Path:
+def app_data_directory() -> Path:
     local_app_data = os.environ.get("LOCALAPPDATA")
     if not local_app_data:
         raise SyncError("Khong tim thay bien moi truong LOCALAPPDATA.")
-    return Path(local_app_data) / "EldenRingModSync" / "repository"
+    return Path(local_app_data) / "EldenRingModSync"
+
+
+def cache_directory() -> Path:
+    return app_data_directory() / "repository"
+
+
+def settings_path() -> Path:
+    return app_data_directory() / SETTINGS_FILE_NAME
+
+
+def load_settings() -> dict:
+    try:
+        path = settings_path()
+        if path.is_file():
+            data = json.loads(path.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError, SyncError):
+        pass
+    return {}
+
+
+def save_settings(settings: dict) -> None:
+    try:
+        path = settings_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(settings, ensure_ascii=False, indent=2), encoding="utf-8")
+    except (OSError, SyncError):
+        pass
 
 
 def find_git() -> str:
@@ -61,23 +91,27 @@ def run_git(git: str, args: list[str], cwd: Path | None = None) -> None:
         raise SyncError(f"Git command that bai: {' '.join(args)}\n{detail}")
 
 
-def update_cache(log) -> Path:
+def update_cache(reporter: "ProgressReporter") -> Path:
     git = find_git()
     cache = cache_directory()
     cache.parent.mkdir(parents=True, exist_ok=True)
 
-    if not (cache / ".git").is_dir():
-        if cache.exists():
-            raise SyncError(f"Cache khong hop le: {cache}")
-        log("Dang tai du lieu mod lan dau...\n")
-        run_git(git, ["clone", "--filter=blob:none", "--no-checkout", REPOSITORY_URL, str(cache)])
-        run_git(git, ["sparse-checkout", "set", "--cone", SOURCE_DIRECTORY], cache)
-    else:
-        log("Dang kiem tra ban cap nhat...\n")
+    reporter.start_indeterminate()
+    try:
+        if not (cache / ".git").is_dir():
+            if cache.exists():
+                raise SyncError(f"Cache khong hop le: {cache}")
+            reporter.set_status("Dang tai du lieu mod lan dau...")
+            run_git(git, ["clone", "--filter=blob:none", "--no-checkout", REPOSITORY_URL, str(cache)])
+            run_git(git, ["sparse-checkout", "set", "--cone", SOURCE_DIRECTORY], cache)
+        else:
+            reporter.set_status("Dang kiem tra ban cap nhat...")
 
-    run_git(git, ["fetch", "--prune", "origin", BRANCH], cache)
-    run_git(git, ["reset", "--hard", f"origin/{BRANCH}"], cache)
-    run_git(git, ["clean", "-ffd"], cache)
+        run_git(git, ["fetch", "--prune", "origin", BRANCH], cache)
+        run_git(git, ["reset", "--hard", f"origin/{BRANCH}"], cache)
+        run_git(git, ["clean", "-ffd"], cache)
+    finally:
+        reporter.stop()
 
     source = cache / SOURCE_DIRECTORY
     if not source.is_dir():
@@ -136,29 +170,45 @@ def remove_empty_parents(path: Path, stop_at: Path) -> None:
         current = current.parent
 
 
-def mirror_to_game(source: Path, game_directory: Path, log) -> tuple[int, int]:
+def mirror_to_game(source: Path, game_directory: Path, reporter: "ProgressReporter") -> tuple[int, int]:
+    reporter.set_status("Dang kiem tra file mod...")
+    reporter.start_indeterminate()
     desired = relative_files(source)
     previous = load_previous_state(game_directory)
-    copied = 0
-    removed = 0
 
-    for relative in previous:
-        if relative not in desired:
-            target = safe_target(game_directory, relative)
-            if target.is_file() or target.is_symlink():
-                target.unlink()
-                remove_empty_parents(target, game_directory)
-                removed += 1
-
+    to_remove = [relative for relative in previous if relative not in desired]
+    to_copy = []
     for relative, source_hash in desired.items():
         target = safe_target(game_directory, relative)
         if target.is_file() and sha256(target) == source_hash:
             continue
+        to_copy.append(relative)
+
+    total = len(to_remove) + len(to_copy)
+    reporter.set_determinate(total)
+
+    copied = 0
+    removed = 0
+
+    reporter.set_status(f"Dang dong bo file... (0/{total})")
+    for relative in to_remove:
+        target = safe_target(game_directory, relative)
+        if target.is_file() or target.is_symlink():
+            target.unlink()
+            remove_empty_parents(target, game_directory)
+            removed += 1
+        reporter.step()
+        reporter.set_status(f"Dang dong bo file... ({copied + removed}/{total})")
+
+    for relative in to_copy:
+        target = safe_target(game_directory, relative)
         target.parent.mkdir(parents=True, exist_ok=True)
         temporary = target.with_name(target.name + ".modsync.tmp")
         shutil.copy2(source / relative, temporary)
         os.replace(temporary, target)
         copied += 1
+        reporter.step()
+        reporter.set_status(f"Dang dong bo file... ({copied + removed}/{total})")
 
     state = {
         "repository": REPOSITORY_URL,
@@ -168,8 +218,68 @@ def mirror_to_game(source: Path, game_directory: Path, log) -> tuple[int, int]:
     (game_directory / STATE_FILE_NAME).write_text(
         json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8"
     )
-    log(f"Da cap nhat {copied} file, da xoa {removed} file cu.\n")
+    reporter.set_status(f"Da cap nhat {copied} file, da xoa {removed} file cu.")
     return copied, removed
+
+
+def launch_game(game_directory: Path) -> None:
+    bat = game_directory / LAUNCH_BAT_NAME
+    if not bat.is_file():
+        raise SyncError(f"Khong tim thay {LAUNCH_BAT_NAME} trong thu muc game.")
+    # Use "start" via a shell so the batch file gets its own console and keeps
+    # running independently of this launcher (mirrors double-clicking it).
+    subprocess.Popen(
+        f'start "" "{bat.name}"',
+        cwd=str(game_directory),
+        shell=True,
+    )
+
+
+class ProgressReporter:
+    """Thread-safe helper that marshals progress-bar / status updates onto the Tk thread."""
+
+    def __init__(self, root: tk.Tk, bar: ttk.Progressbar, status_var: tk.StringVar) -> None:
+        self.root = root
+        self.bar = bar
+        self.status_var = status_var
+
+    def set_status(self, text: str) -> None:
+        self.root.after(0, lambda: self.status_var.set(text))
+
+    def start_indeterminate(self) -> None:
+        def _apply() -> None:
+            self.bar.configure(mode="indeterminate")
+            self.bar.start(12)
+
+        self.root.after(0, _apply)
+
+    def stop(self) -> None:
+        def _apply() -> None:
+            self.bar.stop()
+
+        self.root.after(0, _apply)
+
+    def set_determinate(self, maximum: int) -> None:
+        def _apply() -> None:
+            self.bar.stop()
+            self.bar.configure(mode="determinate", maximum=max(maximum, 1))
+            self.bar["value"] = 0
+
+        self.root.after(0, _apply)
+
+    def step(self, amount: int = 1) -> None:
+        def _apply() -> None:
+            self.bar["value"] += amount
+
+        self.root.after(0, _apply)
+
+    def reset(self) -> None:
+        def _apply() -> None:
+            self.bar.stop()
+            self.bar.configure(mode="determinate", maximum=100)
+            self.bar["value"] = 0
+
+        self.root.after(0, _apply)
 
 
 class Launcher(tk.Tk):
@@ -177,28 +287,48 @@ class Launcher(tk.Tk):
         super().__init__()
         self.title(APP_NAME)
         self.resizable(False, False)
-        self.game_directory = tk.StringVar()
+
+        self.settings = load_settings()
+        self.game_directory = tk.StringVar(value=self.settings.get("game_directory", ""))
+        self._suspend_save = False
+
         self._build_ui()
+        self.reporter = ProgressReporter(self, self.progress, self.status)
+
+        self.game_directory.trace_add("write", self._on_game_directory_changed)
 
     def _build_ui(self) -> None:
         frame = ttk.Frame(self, padding=16)
         frame.grid(sticky="nsew")
+        frame.columnconfigure(0, weight=1)
+
         ttk.Label(frame, text="Chon thu muc Game (chua eldenring.exe):").grid(row=0, column=0, columnspan=2, sticky="w")
         ttk.Entry(frame, width=58, textvariable=self.game_directory).grid(row=1, column=0, pady=(6, 10), sticky="ew")
         ttk.Button(frame, text="Chon...", command=self.choose_game_directory).grid(row=1, column=1, padx=(8, 0), pady=(6, 10))
-        self.sync_button = ttk.Button(frame, text="Dong bo mod", command=self.start_sync)
-        self.sync_button.grid(row=2, column=0, columnspan=2, sticky="ew")
+
+        self.action_button = ttk.Button(frame, text="Dong bo & Choi game", command=self.start_sync_and_play)
+        self.action_button.grid(row=2, column=0, columnspan=2, sticky="ew", ipady=4)
+
+        self.progress = ttk.Progressbar(frame, orient="horizontal", mode="determinate", maximum=100)
+        self.progress.grid(row=3, column=0, columnspan=2, pady=(12, 0), sticky="ew")
+
         self.status = tk.StringVar(value="San sang.")
-        ttk.Label(frame, textvariable=self.status, wraplength=450).grid(row=3, column=0, columnspan=2, pady=(12, 0), sticky="w")
+        ttk.Label(frame, textvariable=self.status, wraplength=450).grid(row=4, column=0, columnspan=2, pady=(8, 0), sticky="w")
+
+    def _on_game_directory_changed(self, *_) -> None:
+        if self._suspend_save:
+            return
+        self.settings["game_directory"] = self.game_directory.get().strip()
+        save_settings(self.settings)
 
     def choose_game_directory(self) -> None:
         selected = filedialog.askdirectory(title="Chon thu muc Game cua Elden Ring")
         if selected:
             self.game_directory.set(selected)
 
-    def start_sync(self) -> None:
-        selected = Path(self.game_directory.get()).expanduser()
-        if not selected.is_dir():
+    def start_sync_and_play(self) -> None:
+        selected = Path(self.game_directory.get().strip()).expanduser()
+        if not self.game_directory.get().strip() or not selected.is_dir():
             messagebox.showerror(APP_NAME, "Hay chon mot thu muc Game hop le.")
             return
         if not (selected / "eldenring.exe").is_file():
@@ -208,25 +338,27 @@ class Launcher(tk.Tk):
                 "Thuong duong dan la ...\\ELDEN RING\\Game.",
             ):
                 return
-        self.sync_button.configure(state="disabled")
+
+        self.action_button.configure(state="disabled")
         self.status.set("Dang dong bo...")
-        threading.Thread(target=self._sync_worker, args=(selected,), daemon=True).start()
+        threading.Thread(target=self._sync_and_play_worker, args=(selected,), daemon=True).start()
 
-    def _sync_worker(self, game_directory: Path) -> None:
-        def log(message: str) -> None:
-            self.after(0, lambda: self.status.set(message.strip()))
-
+    def _sync_and_play_worker(self, game_directory: Path) -> None:
         try:
-            source = update_cache(log)
-            copied, removed = mirror_to_game(source, game_directory, log)
+            source = update_cache(self.reporter)
+            copied, removed = mirror_to_game(source, game_directory, self.reporter)
+            self.reporter.set_status(
+                f"Dong bo xong: {copied} cap nhat, {removed} file cu da xoa. Dang khoi dong game..."
+            )
+            launch_game(game_directory)
         except (SyncError, OSError) as error:
             self.after(0, lambda: messagebox.showerror(APP_NAME, str(error)))
-            self.after(0, lambda: self.status.set("Dong bo that bai."))
+            self.reporter.set_status("That bai.")
         else:
-            self.after(0, lambda: self.status.set(f"Hoan tat: {copied} cap nhat, {removed} file cu da xoa."))
-            self.after(0, lambda: messagebox.showinfo(APP_NAME, "Dong bo mod thanh cong."))
+            self.reporter.set_status("Da dong bo va khoi dong game.")
         finally:
-            self.after(0, lambda: self.sync_button.configure(state="normal"))
+            self.reporter.reset()
+            self.after(0, lambda: self.action_button.configure(state="normal"))
 
 
 if __name__ == "__main__":
