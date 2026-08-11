@@ -1,2 +1,7 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+
+# The mod payload must reach every machine byte-for-byte identical.  Without
+# this, Git rewrites line endings in any file it guesses is text (.hks scripts,
+# .ini, .js), so what a teammate checks out differs from what was committed.
+_mod_data/** -text
