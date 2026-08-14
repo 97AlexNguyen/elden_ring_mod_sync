@@ -39,6 +39,14 @@ STATE_FILE_NAME = ".elden_ring_mod_sync.json"
 DIRECTORY_MAP = {"config": ""}
 LAUNCH_BAT_NAME = "launchmod_eldenring.bat"
 SETTINGS_FILE_NAME = "settings.json"
+HASH_CACHE_FILE_NAME = "source_hashes.json"
+TEMPORARY_SUFFIX = ".modsync.tmp"
+
+# "sparse-checkout --cone" landed in 2.25 and "--filter=blob:none" in 2.19, so a
+# Git older than this is skipped in favour of the portable build below.  Without
+# the check an ancient Git on PATH fails deep inside the clone with a message
+# nobody can act on.
+MINIMUM_GIT_VERSION = (2, 25)
 
 # Portable Git, published by the Git for Windows project for exactly this use.
 # The hash is verified before anything is extracted, because the archive ships
@@ -105,6 +113,36 @@ def save_settings(settings: dict) -> None:
         path.write_text(json.dumps(settings, ensure_ascii=False, indent=2), encoding="utf-8")
     except (OSError, SyncError):
         pass
+
+
+def hash_cache_path() -> Path:
+    return app_data_directory() / HASH_CACHE_FILE_NAME
+
+
+def load_hash_cache() -> dict:
+    try:
+        path = hash_cache_path()
+        if path.is_file():
+            data = json.loads(path.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError, SyncError):
+        pass
+    return {}
+
+
+def save_hash_cache(cache: dict) -> None:
+    try:
+        path = hash_cache_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(cache), encoding="utf-8")
+    except (OSError, SyncError):
+        pass
+
+
+def file_signature(path: Path) -> tuple[int, int]:
+    """Size and modification time, used to skip re-reading an untouched file."""
+    info = path.stat()
+    return info.st_size, info.st_mtime_ns
 
 
 def force_remove_tree(path: Path) -> None:
@@ -175,8 +213,11 @@ def install_portable_git(reporter: "ProgressReporter") -> None:
 
         reporter.set_status("Dang giai nen Git...")
         force_remove_tree(staging)
-        with zipfile.ZipFile(archive) as bundle:
-            bundle.extractall(staging)
+        try:
+            with zipfile.ZipFile(archive) as bundle:
+                bundle.extractall(staging)
+        except zipfile.BadZipFile as error:
+            raise SyncError(f"Goi Git tai ve khong giai nen duoc:\n{error}") from error
         if not (staging / "cmd" / "git.exe").is_file():
             raise SyncError("Goi Git tai ve bi thieu git.exe.")
 
@@ -184,6 +225,11 @@ def install_portable_git(reporter: "ProgressReporter") -> None:
         # a half-extracted Git behind.
         target = portable_git_directory()
         force_remove_tree(target)
+        if target.exists():
+            raise SyncError(
+                f"Khong xoa duoc ban Git cu:\n{target}\n\n"
+                "Hay dong cac chuong trinh dang dung thu muc nay roi thu lai."
+            )
         staging.replace(target)
     finally:
         reporter.stop()
@@ -191,38 +237,65 @@ def install_portable_git(reporter: "ProgressReporter") -> None:
         force_remove_tree(staging)
 
 
-def ensure_git(reporter: "ProgressReporter") -> str:
-    system_git = shutil.which("git")
-    if system_git:
-        return system_git
-    for candidate in (
-        Path(os.environ.get("ProgramFiles", "")) / "Git" / "cmd" / "git.exe",
-        Path(os.environ.get("ProgramFiles(x86)", "")) / "Git" / "cmd" / "git.exe",
-    ):
-        if candidate.is_file():
-            return str(candidate)
-
-    portable = portable_git_executable()
-    if portable.is_file():
-        return str(portable)
-
-    install_portable_git(reporter)
-    if not portable.is_file():
-        raise SyncError("Khong cai duoc Git di dong.")
-    return str(portable)
-
-
-def run_git(git: str, args: list[str], cwd: Path | None = None) -> None:
+def run_git(git: str, args: list[str], cwd: Path | None = None) -> str:
     result = subprocess.run(
         [git, *args],
         cwd=cwd,
         text=True,
         capture_output=True,
+        # Git for Windows speaks UTF-8, but the console codepage does not, and a
+        # strict decode of an accented error message would blow up here instead
+        # of surfacing the actual failure.
+        encoding="utf-8",
+        errors="replace",
         creationflags=CREATE_NO_WINDOW,
     )
     if result.returncode != 0:
         detail = (result.stderr or result.stdout).strip()
         raise SyncError(f"Git command that bai: {' '.join(args)}\n{detail}")
+    return result.stdout.strip()
+
+
+def git_version(git: str) -> tuple[int, ...] | None:
+    """Parse "git version 2.55.0.windows.3" into (2, 55, 0), or None if unusable."""
+    try:
+        output = run_git(git, ["--version"])
+    except (SyncError, OSError):
+        return None
+    parts = output.split()
+    if len(parts) < 3:
+        return None
+    numbers = []
+    for piece in parts[2].split("."):
+        if not piece.isdigit():
+            break
+        numbers.append(int(piece))
+    return tuple(numbers) or None
+
+
+def ensure_git(reporter: "ProgressReporter") -> str:
+    candidates = []
+    system_git = shutil.which("git")
+    if system_git:
+        candidates.append(system_git)
+    for program_files in ("ProgramFiles", "ProgramFiles(x86)"):
+        root = os.environ.get(program_files)
+        if root:
+            candidates.append(str(Path(root) / "Git" / "cmd" / "git.exe"))
+    portable = portable_git_executable()
+    candidates.append(str(portable))
+
+    for candidate in candidates:
+        if not Path(candidate).is_file():
+            continue
+        version = git_version(candidate)
+        if version and version >= MINIMUM_GIT_VERSION:
+            return candidate
+
+    install_portable_git(reporter)
+    if not portable.is_file():
+        raise SyncError("Khong cai duoc Git di dong.")
+    return str(portable)
 
 
 def clone_cache(git: str, cache: Path, reporter: "ProgressReporter") -> None:
@@ -262,6 +335,31 @@ def refresh_cache(git: str, cache: Path, reporter: "ProgressReporter") -> None:
         reporter.stop()
 
 
+def normalized_remote(url: str) -> str:
+    return url.strip().rstrip("/").removesuffix(".git").lower()
+
+
+def cache_points_at_repository(git: str, cache: Path) -> bool:
+    """Whether the cache still tracks REPOSITORY_URL.
+
+    A cache cloned from an older URL would otherwise keep fetching the old repo
+    forever, silently shipping stale mods long after the constant changed.
+    """
+    try:
+        origin = run_git(git, ["remote", "get-url", "origin"], cache)
+    except SyncError:
+        try:
+            run_git(git, ["rev-parse", "--git-dir"], cache)
+        except SyncError:
+            # The repository itself is damaged rather than mis-pointed.  Say so
+            # by leaving it to refresh_cache, which reports a corrupt cache.
+            return True
+        # A healthy repository with no usable origin can never fetch, so rebuild
+        # it here instead of letting the network step take the blame.
+        return False
+    return normalized_remote(origin) == normalized_remote(REPOSITORY_URL)
+
+
 def discard_cache(cache: Path) -> None:
     force_remove_tree(cache)
     if cache.exists():
@@ -280,6 +378,10 @@ def update_cache(reporter: "ProgressReporter") -> Path:
     # that as disposable instead of turning it into a permanent dead end.
     if cache.exists() and not (cache / ".git").is_dir():
         reporter.set_status("Cache khong hop le, dang tao lai...")
+        discard_cache(cache)
+
+    if (cache / ".git").is_dir() and not cache_points_at_repository(git, cache):
+        reporter.set_status("Cache tro toi repo khac, dang tai lai...")
         discard_cache(cache)
 
     if (cache / ".git").is_dir():
@@ -310,7 +412,14 @@ def game_relative_path(source_relative: str) -> str:
 
 
 def collect_files(root: Path) -> dict[str, tuple[str, str]]:
-    """Map each destination inside Game to its source path and content hash."""
+    """Map each destination inside Game to its source path and content hash.
+
+    Hashes are memoised against size and mtime.  The payload runs to hundreds of
+    megabytes and Git only rewrites the files that actually changed, so a plain
+    re-read of everything would dominate the runtime of an otherwise no-op sync.
+    """
+    cached = load_hash_cache()
+    fresh: dict[str, list] = {}
     result: dict[str, tuple[str, str]] = {}
     for path in sorted(root.rglob("*")):
         if not path.is_file():
@@ -325,11 +434,29 @@ def collect_files(root: Path) -> dict[str, tuple[str, str]]:
                 "Hai file cung do vao mot cho trong thu muc game:\n"
                 f"{result[destination][0]}\n{source_relative}\n-> {destination}"
             )
-        result[destination] = (source_relative, sha256(path))
+        size, mtime = file_signature(path)
+        entry = cached.get(source_relative)
+        if (
+            isinstance(entry, list)
+            and len(entry) == 3
+            and entry[:2] == [size, mtime]
+            and isinstance(entry[2], str)
+        ):
+            digest = entry[2]
+        else:
+            digest = sha256(path)
+        fresh[source_relative] = [size, mtime, digest]
+        result[destination] = (source_relative, digest)
+    save_hash_cache(fresh)
     return result
 
 
-def load_previous_state(game_directory: Path) -> dict[str, str]:
+def load_previous_state(game_directory: Path) -> dict[str, dict]:
+    """Read the per-file record left by the previous sync.
+
+    Entries used to be a bare hash string and are still accepted as one; they
+    simply carry no stat to compare against, so those files get re-hashed once.
+    """
     state_path = game_directory / STATE_FILE_NAME
     if not state_path.is_file():
         return {}
@@ -338,9 +465,18 @@ def load_previous_state(game_directory: Path) -> dict[str, str]:
         if state.get("repository") != REPOSITORY_URL:
             return {}
         files = state.get("files", {})
-        return files if isinstance(files, dict) else {}
+        if not isinstance(files, dict):
+            return {}
     except (OSError, json.JSONDecodeError):
         return {}
+
+    previous: dict[str, dict] = {}
+    for relative, value in files.items():
+        if isinstance(value, str):
+            previous[relative] = {"sha256": value}
+        elif isinstance(value, dict) and isinstance(value.get("sha256"), str):
+            previous[relative] = value
+    return previous
 
 
 def safe_target(root: Path, relative: str) -> Path:
@@ -351,8 +487,14 @@ def safe_target(root: Path, relative: str) -> Path:
 
 
 def remove_empty_parents(path: Path, stop_at: Path) -> None:
+    """Prune directories left empty by a deletion, never climbing past stop_at.
+
+    The containment test is what keeps this inside the game folder: if the two
+    paths ever disagree on form, the loop refuses to run instead of walking up
+    the drive removing whatever happens to be empty.
+    """
     current = path.parent
-    while current != stop_at:
+    while current != stop_at and stop_at in current.parents:
         try:
             current.rmdir()
         except OSError:
@@ -360,25 +502,77 @@ def remove_empty_parents(path: Path, stop_at: Path) -> None:
         current = current.parent
 
 
+def locked_file_error(error: OSError) -> SyncError:
+    return SyncError(
+        f"Khong truy cap duoc file mod:\n{error}\n\n"
+        "Hay dam bao Elden Ring dang khong chay roi thu lai."
+    )
+
+
+def target_is_current(target: Path, expected: str, recorded: dict | None) -> bool:
+    """Whether the game already holds the wanted content.
+
+    The recorded stat is trusted only when it matches the file on disk exactly;
+    anything else falls back to reading the file, so a hand-edited or replaced
+    file is still noticed.
+    """
+    if not target.is_file():
+        return False
+    if recorded and recorded.get("sha256") == expected:
+        try:
+            size, mtime = file_signature(target)
+        except OSError:
+            size = None
+        if size is not None and recorded.get("size") == size and recorded.get("mtime_ns") == mtime:
+            return True
+    return sha256(target) == expected
+
+
+def write_state(game_directory: Path, desired: dict[str, tuple[str, str]]) -> None:
+    """Record what the game folder now holds.
+
+    Keyed by destination, so a file that later moves inside _mod_data is still
+    recognised and cleaned up correctly at its old location in the game folder.
+    Each entry carries the stat of the file as written, which lets the next run
+    skip re-hashing it.
+    """
+    files = {}
+    for relative, (_, digest) in desired.items():
+        entry = {"sha256": digest}
+        try:
+            size, mtime = file_signature(safe_target(game_directory, relative))
+        except OSError:
+            pass
+        else:
+            entry["size"] = size
+            entry["mtime_ns"] = mtime
+        files[relative] = entry
+
+    state = {"repository": REPOSITORY_URL, "branch": BRANCH, "files": files}
+    (game_directory / STATE_FILE_NAME).write_text(
+        json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+
 def mirror_to_game(source: Path, game_directory: Path, reporter: "ProgressReporter") -> tuple[int, int]:
     reporter.set_status("Dang kiem tra file mod...")
     reporter.start_indeterminate()
-    desired = collect_files(source)
-    previous = load_previous_state(game_directory)
+    try:
+        desired = collect_files(source)
+        previous = load_previous_state(game_directory)
 
-    stale = [relative for relative in previous if relative not in desired]
-    outdated = []
-    for relative, (_, source_hash) in desired.items():
-        target = safe_target(game_directory, relative)
-        if target.is_file() and sha256(target) == source_hash:
-            continue
-        outdated.append(relative)
+        stale = [relative for relative in previous if relative not in desired]
+        outdated = []
+        for relative, (_, source_hash) in desired.items():
+            target = safe_target(game_directory, relative)
+            if not target_is_current(target, source_hash, previous.get(relative)):
+                outdated.append(relative)
+    except PermissionError as error:
+        # A file the game still holds open fails here, before a single write.
+        raise locked_file_error(error) from error
 
     total = len(stale) + len(outdated)
     reporter.set_determinate(total)
-    if not total:
-        reporter.set_status("Mod da la ban moi nhat.")
-        return 0, 0
 
     copied = 0
     removed = 0
@@ -396,28 +590,27 @@ def mirror_to_game(source: Path, game_directory: Path, reporter: "ProgressReport
             source_relative, _ = desired[relative]
             target = safe_target(game_directory, relative)
             target.parent.mkdir(parents=True, exist_ok=True)
-            temporary = target.with_name(target.name + ".modsync.tmp")
-            shutil.copy2(source / source_relative, temporary)
-            os.replace(temporary, target)
+            temporary = target.with_name(target.name + TEMPORARY_SUFFIX)
+            try:
+                shutil.copy2(source / source_relative, temporary)
+                os.replace(temporary, target)
+            finally:
+                # A copy that dies partway must not leave its scratch file in the
+                # game folder: nothing downstream tracks it, so it would sit there
+                # for good.  After a successful replace this is already gone.
+                temporary.unlink(missing_ok=True)
             copied += 1
             reporter.step()
             reporter.set_status(f"Dang dong bo... {copied + removed}/{total}")
     except PermissionError as error:
-        raise SyncError(
-            f"Khong ghi duoc file mod:\n{error}\n\n"
-            "Hay dam bao Elden Ring dang khong chay roi thu lai."
-        ) from error
+        raise locked_file_error(error) from error
 
-    # Keyed by destination, so a file that later moves inside _mod_data is still
-    # recognised and cleaned up correctly at its old location in the game folder.
-    state = {
-        "repository": REPOSITORY_URL,
-        "branch": BRANCH,
-        "files": {relative: digest for relative, (_, digest) in desired.items()},
-    }
-    (game_directory / STATE_FILE_NAME).write_text(
-        json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
+    # Written even when nothing changed.  A game folder that already matched the
+    # repo would otherwise never get a state file, and every file later removed
+    # from the repo would stay behind forever.
+    write_state(game_directory, desired)
+    if not total:
+        reporter.set_status("Mod da la ban moi nhat.")
     return copied, removed
 
 
@@ -442,8 +635,20 @@ class ProgressReporter:
         self.bar = bar
         self.status_var = status_var
 
+    def post(self, callback) -> None:
+        """Hand a UI call to Tk, tolerating a window closed mid-sync.
+
+        The worker is a daemon thread and keeps reporting for a moment after the
+        window goes away; without this the thread would die on a TclError far
+        from anything the user could see.
+        """
+        try:
+            self.root.after(0, callback)
+        except (tk.TclError, RuntimeError):
+            pass
+
     def set_status(self, text: str) -> None:
-        self.root.after(0, lambda: self.status_var.set(text))
+        self.post(lambda: self.status_var.set(text))
 
     def start_indeterminate(self) -> None:
         def apply() -> None:
@@ -451,10 +656,10 @@ class ProgressReporter:
             self.bar.configure(mode="indeterminate")
             self.bar.start(12)
 
-        self.root.after(0, apply)
+        self.post(apply)
 
     def stop(self) -> None:
-        self.root.after(0, self.bar.stop)
+        self.post(self.bar.stop)
 
     def set_determinate(self, maximum: int) -> None:
         def apply() -> None:
@@ -462,16 +667,16 @@ class ProgressReporter:
             self.bar.configure(mode="determinate", maximum=max(maximum, 1))
             self.bar["value"] = 0
 
-        self.root.after(0, apply)
+        self.post(apply)
 
     def set_value(self, value: int) -> None:
-        self.root.after(0, lambda: self.bar.configure(value=value))
+        self.post(lambda: self.bar.configure(value=value))
 
     def step(self, amount: int = 1) -> None:
         def apply() -> None:
             self.bar["value"] = self.bar["value"] + amount
 
-        self.root.after(0, apply)
+        self.post(apply)
 
     def reset(self) -> None:
         def apply() -> None:
@@ -479,7 +684,7 @@ class ProgressReporter:
             self.bar.configure(mode="determinate", maximum=100)
             self.bar["value"] = 0
 
-        self.root.after(0, apply)
+        self.post(apply)
 
 
 class Launcher(tk.Tk):
@@ -490,10 +695,13 @@ class Launcher(tk.Tk):
 
         self.settings = load_settings()
         self.game_directory = tk.StringVar(value=self.settings.get("game_directory", ""))
+        self.busy = False
+        self._save_job: str | None = None
 
         self._build_ui()
         self.reporter = ProgressReporter(self, self.progress, self.status)
         self.game_directory.trace_add("write", self._on_game_directory_changed)
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
 
     def _build_ui(self) -> None:
         frame = ttk.Frame(self, padding=16)
@@ -524,8 +732,37 @@ class Launcher(tk.Tk):
         )
 
     def _on_game_directory_changed(self, *_) -> None:
+        # The entry fires this on every keystroke, so the write is debounced and
+        # half-typed paths never reach the settings file.
+        if self._save_job is not None:
+            self.after_cancel(self._save_job)
+        self._save_job = self.after(600, self._save_game_directory)
+
+    def _save_game_directory(self) -> None:
+        self._save_job = None
         self.settings["game_directory"] = self.game_directory.get().strip()
         save_settings(self.settings)
+
+    def _flush_settings(self) -> None:
+        if self._save_job is not None:
+            self.after_cancel(self._save_job)
+        self._save_game_directory()
+
+    def _on_close(self) -> None:
+        if self.busy and not messagebox.askyesno(
+            APP_NAME,
+            "Dang dong bo. Thoat bay gio co the de lai mod chua day du.\n\nVan thoat?",
+        ):
+            return
+        self._flush_settings()
+        self.destroy()
+
+    def post(self, callback) -> None:
+        """Queue a UI call from the worker thread; see ProgressReporter.post."""
+        try:
+            self.after(0, callback)
+        except (tk.TclError, RuntimeError):
+            pass
 
     def choose_game_directory(self) -> None:
         selected = filedialog.askdirectory(title="Chon thu muc Game cua Elden Ring")
@@ -533,8 +770,16 @@ class Launcher(tk.Tk):
             self.game_directory.set(selected)
 
     def start_sync_and_play(self) -> None:
+        if self.busy:
+            return
         raw = self.game_directory.get().strip()
-        selected = Path(raw).expanduser() if raw else None
+        # Resolved once, here: everything downstream compares against resolved
+        # paths, and a folder reached through a junction or a "..\" would other-
+        # wise never compare equal to them.
+        try:
+            selected = Path(raw).expanduser().resolve() if raw else None
+        except OSError:
+            selected = None
         if selected is None or not selected.is_dir():
             messagebox.showerror(APP_NAME, "Hay chon mot thu muc Game hop le.")
             return
@@ -546,6 +791,8 @@ class Launcher(tk.Tk):
             ):
                 return
 
+        self._flush_settings()
+        self.busy = True
         self.action_button.configure(state="disabled")
         self.status.set("Dang bat dau...")
         threading.Thread(target=self._worker, args=(selected,), daemon=True).start()
@@ -558,9 +805,16 @@ class Launcher(tk.Tk):
                 f"Da dong bo {copied} file, xoa {removed} file cu. Dang khoi dong game..."
             )
             launch_game(game_directory)
-        except (SyncError, OSError) as error:
-            message = str(error)
-            self.after(0, lambda: messagebox.showerror(APP_NAME, message))
+        # Deliberately broad: this dialog is the only place a worker failure can
+        # ever be seen.  Anything narrower and an unforeseen error would leave
+        # the button re-enabled with no explanation of what went wrong.
+        except Exception as error:
+            message = (
+                str(error)
+                if isinstance(error, (SyncError, OSError))
+                else f"Loi khong mong doi:\n{error.__class__.__name__}: {error}"
+            )
+            self.post(lambda: messagebox.showerror(APP_NAME, message))
             self.reporter.set_status("That bai.")
         else:
             self.reporter.set_status(
@@ -568,7 +822,11 @@ class Launcher(tk.Tk):
             )
         finally:
             self.reporter.reset()
-            self.after(0, lambda: self.action_button.configure(state="normal"))
+            self.post(self._finish)
+
+    def _finish(self) -> None:
+        self.busy = False
+        self.action_button.configure(state="normal")
 
 
 if __name__ == "__main__":
