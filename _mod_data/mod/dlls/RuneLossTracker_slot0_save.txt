@@ -1,2 +1,0 @@
-total_runes_lost: 43058
-deaths: 37
