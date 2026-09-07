@@ -37,7 +37,7 @@ STATE_FILE_NAME = ".elden_ring_mod_sync.json"
 # is a staging folder: its contents belong loose in the Game root, next to
 # eldenring.exe, which is how extra DLLs and launcher settings get shipped.
 DIRECTORY_MAP = {"config": ""}
-LAUNCH_BAT_NAME = "launchmod_eldenring.bat"
+LAUNCH_BAT_NAME = "modengine2_launcher.exe"
 SETTINGS_FILE_NAME = "settings.json"
 HASH_CACHE_FILE_NAME = "source_hashes.json"
 TEMPORARY_SUFFIX = ".modsync.tmp"
